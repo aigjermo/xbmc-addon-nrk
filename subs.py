@@ -24,6 +24,8 @@ from io import BytesIO
 
 def get_subtitles(video_id):
     ttml_sub_url = requests.get("http://psapi-granitt-prod-we.cloudapp.net/mediaelement/%s" % (video_id)).json()["subtitlesUrlPath"]
+    if not ttml_sub_url:
+        return None
     html = requests.get(ttml_sub_url).text
     if not html:
         return None

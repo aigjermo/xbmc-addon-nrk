@@ -17,25 +17,70 @@
 
 from __future__ import unicode_literals
 
-import datetime
 import re
 import xbmc
+import json
+import time
+from datetime import datetime
 from requests import Session
 
 session = Session()
 session.headers['User-Agent'] = 'kodi.tv'
 
+def _get(path, params=''):
+    api_key = 'd1381d92278a47c09066460f2522a67d'
+    r = session.get('https://psapi.nrk.no{}?apiKey={}{}'.format(path, api_key, params))
+    parsed = r.json()
+    xbmc.log('NRK REQUEST: {}'.format(path).encode('utf-8'), xbmc.LOGDEBUG)
+    #xbmc.log('NRK REQUEST: {} ->\n{}'.format(path, json.dumps(r.json(), indent=4)).encode('utf-8'), xbmc.LOGDEBUG)
+    r.raise_for_status()
+    return parsed
+
+def _getDeep(obj, next_key, *remaining_keys):
+    obj = obj.get(next_key)
+    return _getDeep(obj, *remaining_keys) if obj and remaining_keys else obj
+
+
+def _getImageUrlFromList(items, min_width=0):
+    for image in items or []:
+        if image.get('width', 0) >= min_width:
+            xbmc.log('selected image: ' + str(image), xbmc.LOGDEBUG)
+            return image.get('url') or image.get('uri')
+
+
+def _image_url_key_standardize(images):
+    xs = images
+    for image in xs:
+        image['url'] = image['imageUrl']
+        del image['imageUrl']
+    return xs
+
+
+def _get_playback_url(manifest_url):
+    playable = _get(manifest_url)['playable']
+    if playable:
+        return playable['assets'][0]['url']
+    else:
+        return None
+
 
 class ImageMixin(object):
-    images = None
+    thumbs = None
+    posters = None
+    backdrops = None
+
 
     @property
     def thumb(self):
-        return self.images[0]['url']
+        return _getImageUrlFromList(self.thumbs, min_width=400)
+
+    @property
+    def poster(self):
+        return _getImageUrlFromList(self.posters, min_width=800)
 
     @property
     def fanart(self):
-        return self.images[-1]['url']
+        return _getImageUrlFromList(self.backdrops, min_width=1920)
 
 
 class Base(object):
@@ -47,12 +92,16 @@ class Base(object):
         self.__dict__.update(kwargs)
 
 
-class Category(Base):
+class Category(ImageMixin, Base):
+
     @staticmethod
     def from_response(r):
         return Category(
-            title=r.get('displayValue', r.get('title', None)),
-            id=r.get('id', None),
+            id=r.get('id'),
+            title=r.get('title') or r.get('displayValue'),
+            thumbs=_getDeep(r, 'image', 'webImages'),
+            posters=_getDeep(r, 'mainCategoryImages', 'landscape', 'webImages'),
+            backdrops=_getDeep(r, 'mainCategoryImages', 'landscape', 'webImages'),
         )
 
 
@@ -103,122 +152,103 @@ class Season(Base):
         )
 
 
-class Program(Series):
-    is_series = False
-
-    episode = None
-    '''Episode number, name or date as string.'''
-
-    series_id = None
-
-    aired = None
-    '''Date and time aired as :class:`datetime.datetime`'''
-
-    duration = None
-    '''In seconds'''
-
-    media_urls = None
+class Program(ImageMixin, Base):
 
     @staticmethod
-    def from_response(r):
-        category = Category.from_response(r['category']) if 'category' in r else None
-        aired = None
-        try:
-            if 'usageRights' in r:
-                usageRights = r.get('usageRights', None)
-                availableFrom = usageRights.get('availableFrom') if usageRights else ''
-                availableFrom = re.findall(r'\d+', availableFrom)[0] if availableFrom else 0
-                aired = datetime.datetime.fromtimestamp(int(availableFrom)/1000)
-        except (ValueError, OverflowError, OSError):
-            pass
-
-        title = r.get('title', '')
-        if not title:
-            seriesTitle = r.get('seriesTitle', '')
-            episodeTitle = r.get('episodeTitle', '')
-            title = '{} {}'.format(seriesTitle, episodeTitle)
-
-        media_urls = []
-        if 'mediaAssetsOnDemand' in r:
-            def format_path(part):
-                try:
-                    bitrates = [str(x) for x in part['bitrates']]
-                    return part['urlPattern'].format(
-                            'i',
-                            ',' + ','.join(bitrates) + ',',
-                            'master.m3u8')
-                except (KeyError, IndexError):
-                    # Fall back to previous behavior
-                    return part['hlsUrl']
-
-            parts = sorted(r['mediaAssetsOnDemand'], key=lambda x: x['part'])
-            media_urls = [format_path(part) for part in parts]
-
-        images = _image_url_key_standardize(r.get('image', {}).get('webImages', None))
-        duration = _duration_to_seconds(r.get('duration', 0))
-        legal_age = r.get('legalAge', None)
-        if legal_age:
-            legal_age = legal_age.get('displayValue', legal_age)
-        elif 'aldersgrense' in r:
-            legal_age = r.get('aldersgrense')
-
+    def from_id(program_id):
         return Program(
-            id=r['id'],
-            title=title,
-            category=category,
-            description=r.get('shortDescription'),
-            duration=duration,
-            images=images,
-            legal_age=legal_age,
-            media_urls=media_urls,
-            episode=r.get('episodeNumberOrDate', 0),
-            aired=aired,
-            available=r.get('availability', {}).get('status', 'unavailable') == 'available'
-        )
+                id=program_id,
+                _program_href='/programs/%s' % program_id,
+                _playback_href='/playback/metadata/%s' % program_id,
+                )
 
-def _duration_to_seconds(duration):
-    if isinstance(duration, float) or isinstance(duration, int):
-        return duration * 60
-    else:
-        hours = re.findall(r'\d+H', duration)
-        hours = float(hours[0][:-1]) if len(hours) else 0
-        minutes = re.findall(r'\d+M', duration)
-        minutes = float(minutes[0][:-1]) if len(minutes) else 0
-        seconds = re.findall(r'\d+S', duration)
-        seconds = float(seconds[0][:-1]) if len(seconds) else 0
-        return hours * 60**2 + minutes * 60 + seconds
+    @property
+    def _program(self):
+        if not hasattr(self, '_program_r'):
+            self._program_r = _get(self._program_href)
+        return self._program_r
 
-def _image_url_key_standardize(images):
-    xs = images
-    for image in xs:
-        image['url'] = image['imageUrl']
-        del image['imageUrl']
-    return xs
+    @property
+    def _playback(self):
+        if not hasattr(self, '_playback_r'):
+            self._playback_r = _get(self._playback_href)
+        return self._playback_r
 
-def _get(path, params=''):
-    api_key = 'd1381d92278a47c09066460f2522a67d'
-    r = session.get('https://psapi.nrk.no{}?apiKey={}{}'.format(path, api_key, params))
-    r.raise_for_status()
-    return r.json()
+    @property
+    def title(self):
+        return _getDeep(self._program, 'title')
+
+    @property
+    def subtitle(self):
+        #return _getDeep(self._playback, 'preplay', 'titles', 'subtitle')
+        pass
 
 
-def get_playback_url(manifest_url):
-    playable = _get(manifest_url)['playable']
-    if playable:
-        return playable['assets'][0]['url']
-    else:
-        return None
+    @property
+    def description(self):
+        return _getDeep(self._program, 'shortDescription')
+
+    @property
+    def category(self):
+        categoryObj = _getDeep(self._program, 'category')
+        category = Category.from_response(categoryObj) if categoryObj else None
+
+    @property
+    def categories(self):
+        return [Category.from_response(cat) for cat in
+                self._program.get('categories')]
+
+    @property
+    def thumbs(self):
+        return _getDeep(self._program, 'image', 'webImages')
+
+    @property
+    def posters(self):
+        return _getDeep(self._playback, 'preplay', 'poster', 'images')
+
+    @property
+    def aired(self):
+        try:
+            aired_str = _getDeep(self._program,
+                    'moreInformation', 'releaseDateOnDemand')[:19]
+            return datetime(*(time.strptime(aired_str, "%Y-%m-%dT%H:%M:%S")[0:6]))
+        except ValueError:
+            return None
+
+    @property
+    def duration(self):
+        return  _getDeep(self._program, 'moreInformation', 'duration', 'seconds')
+
+    @property
+    def legal_age(self):
+        return _getDeep(self._playback, 'legalAge', 'body', 'rating', 'displayAge')
+
+
+    @property
+    def available(self):
+        #return self._playback.get('playability') == 'playable'
+        return _getDeep(self._program,
+                'programInformation', 'availability', 'status') in [
+                        'available', 'expires']
+
+    @property
+    def media_urls(self):
+        manifests = _getDeep(self._playback, '_links', 'manifests')
+        for link in manifests:
+            url = _get_playback_url(link['href'])
+            if url:
+                return [url]
 
 
 def recommended_programs(medium='tv', category_id=None):
     if category_id:
-        return [program(item['id']) for item in
-                _get('/medium/%s/categories/%s/recommendedprograms' % (medium, category_id),
-                     '&maxnumber=15')]
+        url = '/medium/%s/categories/%s/recommendedprograms' % (medium, category_id)
     else:
-        return [program(item['id']) for item in
-                _get('/medium/%s/recommendedprograms' % medium,
-                     '&maxnumber=15')]
+        url = '/medium/%s/recommendedprograms' % medium
+
+    response = _get(url, '&maxnumber=15')
+    return len(response), (program(item['id']) for item in response)
+
 
 def popular_programs(medium='tv', category_id=None, list_type='week'):
     if category_id:
@@ -260,10 +290,7 @@ def seasons(series_id):
 
 
 def program(program_id):
-    response = _get('/programs/%s' % program_id)
-    xbmc.log('NRKTV query for {} -> \n{}'.format(program_id, response), xbmc.LOGINFO)
-    return Program.from_response(response)
-
+    return Program.from_id(program_id)
 
 def channels():
     chs = [Channel.from_response(item) for item in _get('/tv/live')]
@@ -275,7 +302,8 @@ def radios():
 
 
 def categories():
-    return [Category.from_response(item) for item in _get('/medium/tv/categories/')]
+    items = _getDeep(_get('/tv/pages'), 'pageListItems')
+    return [Category.from_response(item) for item in items]
 
 
 def _to_series_or_program(item):
@@ -284,8 +312,8 @@ def _to_series_or_program(item):
     return Program.from_response(item)
 
 
-def programs(category_id):
-    items = _get('/medium/tv/categories/%s/indexelements' % category_id)
+def programs(category_href):
+    items = _get(category_href).get('pageListItems', [])
     items = [item for item in items if item.get('title', '').strip() != ''
              and item['hasOndemandRights']]
     return map(_to_series_or_program, items)
